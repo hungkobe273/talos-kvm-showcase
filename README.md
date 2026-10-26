@@ -1,0 +1,89 @@
+# talos-kvm: a production-style Kubernetes lab on one machine
+
+An on-premise Kubernetes platform built and operated during my internship at VTC Intecom (from 10/2026),
+with the brief "run it like production". Everything runs on a single Ubuntu host with one HDD,
+plus a few free or credit-funded cloud services.
+
+This repository documents the design, the operating model and the lessons learned.
+The live GitOps repository is private; snippets here are sanitized (no hosts, keys or account IDs).
+
+## Architecture
+
+```mermaid
+flowchart TB
+  dev[Developer push] --> gh[GitHub Actions]
+  dev --> jk[Jenkins on GCE]
+  dev --> gl[GitLab CE on GCE]
+  gh -->|image + tag bump| gitops[(GitOps repo)]
+  jk -->|image only| ghcr[(GHCR)]
+  gl -->|image only| ghcr
+  gh --> ghcr
+
+  subgraph host[Ubuntu host, KVM/libvirt]
+    haproxy[HAProxy :443]
+    subgraph k8s[Talos Linux Kubernetes]
+      cp[control plane + VIP]
+      w1[worker 1]
+      w2[worker 2]
+      argo[Argo CD]
+      traefik[Traefik]
+      kc[Keycloak]
+      mon[Prometheus / Grafana]
+      app[demo-app, Argo Rollouts blue-green]
+    end
+    backup[daily backup job]
+  end
+
+  gitops --> argo
+  argo --> app
+  haproxy --> traefik
+  kc --> supa[(Supabase PostgreSQL)]
+  backup -->|GPG encrypted| b2[(Backblaze B2)]
+  mon -->|alerts| tg[Telegram]
+  host -->|heartbeat| hc[healthchecks.io]
+```
+
+## What is in it
+
+| Area | Choice | Why |
+|---|---|---|
+| OS | Talos Linux | Immutable, API-only nodes. No SSH, no drift. |
+| Delivery | Argo CD app-of-apps, self-heal | Git is the only way to change the cluster. |
+| Secrets | Sealed Secrets | Encrypted secrets can live in Git safely. |
+| Releases | Argo Rollouts blue-green + analysis | New version is checked before it gets traffic. |
+| Identity | Keycloak OIDC for Grafana, Argo CD, Headlamp | One login, one place to revoke access. |
+| Database | Keycloak DB on managed PostgreSQL | Moves stateful load off the single HDD. Rollback plan kept. |
+| CI | GitHub Actions deploys; Jenkins and GitLab CE build in parallel | Compare three CI systems on the same app. |
+| Monitoring | Prometheus, Alertmanager to Telegram | Catches problems while the cluster is alive. |
+| Dead man's switch | healthchecks.io pings from host and VMs | Catches the case where nothing is alive to alert. |
+| Backup | etcd snapshot, DB dump, GitLab backup, GPG, B2 | Offsite and encrypted; decryption is tested, not assumed. |
+| Cost | VMs run only 45 of 168 h/week, budget alerts | ~70% less compute spend on cloud credit. |
+
+## Operating model
+
+- Every change is a commit. Rollback is `git revert <specific commit>`, never `HEAD^`.
+- A runbook covers daily start-up, shutdown order, backup checks and known failures.
+- Risky changes get a written plan with a rollback path, and the rollback is rehearsed.
+- Incidents are written up: what broke first, what failed as a consequence, how it was found.
+
+## Lessons learned
+
+1. **One HDD is the real limit.** etcd, Prometheus and image pulls compete for ~128 IOPS.
+   Fewer control-plane nodes and moving the database off-host helped more than adding RAM.
+2. **External dependencies fail together.** The office network uses a captive portal; when it expires,
+   SSO, backups and image pulls all fail at once. The start-up runbook now begins with the portal.
+3. **Self-heal undoes manual fixes.** Planned cutovers pause automated sync first, then re-enable it.
+4. **Revert by hash.** A `git revert HEAD^` once reverted a CI deploy commit instead of the intended change.
+5. **A backup is only real after a restore test.** Each new backup path was decrypted end to end before being trusted.
+6. **Monitor the monitor.** In-cluster alerting cannot report its own death; an external heartbeat can.
+
+## Docs
+
+- [Architecture notes](docs/architecture.md)
+- [CI comparison](docs/ci-comparison.md)
+
+## Stack
+
+Talos Linux, Kubernetes, KVM/libvirt, Argo CD, Argo Rollouts, Sealed Secrets, Traefik, cert-manager,
+Keycloak, Prometheus, Grafana, Alertmanager, GitHub Actions, Jenkins, GitLab CE, Docker, Google Cloud,
+Supabase, Backblaze B2, Bash.
