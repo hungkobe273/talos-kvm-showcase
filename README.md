@@ -76,6 +76,25 @@ flowchart TB
 4. **Revert by hash.** A `git revert HEAD^` once reverted a CI deploy commit instead of the intended change.
 5. **A backup is only real after a restore test.** Each new backup path was decrypted end to end before being trusted.
 6. **Monitor the monitor.** In-cluster alerting cannot report its own death; an external heartbeat can.
+7. **Rehearse the rollback, both ways.** A drill moved Keycloak back to its local database and then forward
+   to managed PostgreSQL again (see below). The way back worked first time; the way forward exposed a real gap.
+
+## Rollback drill: Keycloak database (27/10)
+
+| Step | Change | SSO downtime | Result |
+|---|---|---|---|
+| Roll back to local PostgreSQL | `git revert` of the cutover commit | 3 min 23 s | Login works on the old data |
+| Roll forward to Supabase | `git revert` of the rollback | ~13 min | Stuck rollout, fixed by deleting the pod |
+
+What went wrong on the way forward: the same commit scaled the local database to zero and changed
+Keycloak's database settings. The old Keycloak pod lost its database and became unready before the
+StatefulSet replaced it. With `podManagementPolicy: OrderedReady`, a StatefulSet does not replace a pod
+that is not Ready, so the rollout stalled. Deleting the pod let the new revision start.
+Most of the 13 minutes was detection time; the fix itself took under 2 minutes.
+
+Changes made after the drill:
+- The runbook now checks `currentRevision` against `updateRevision` and deletes the pod if it stays unready for 3 minutes.
+- Next time, split the change into two commits: switch the app first, wait for Ready, then scale the old database down.
 
 ## Docs
 
