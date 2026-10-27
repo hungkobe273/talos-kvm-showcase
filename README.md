@@ -11,13 +11,13 @@ The live GitOps repository is private; snippets here are sanitized (no hosts, ke
 
 ```mermaid
 flowchart TB
-  dev[Developer push] --> gh[GitHub Actions]
-  dev --> jk[Jenkins on GCE]
+  dev[Developer push] --> jk[Jenkins on GCE]
+  dev --> gh[GitHub Actions]
   dev --> gl[GitLab CE on GCE]
-  gh -->|image + tag bump| gitops[(GitOps repo)]
-  jk -->|image only| ghcr[(GHCR)]
+  jk -->|image + tag bump| gitops[(GitOps repo)]
+  jk --> ghcr[(GHCR)]
+  gh -->|image only| ghcr
   gl -->|image only| ghcr
-  gh --> ghcr
 
   subgraph host[Ubuntu host, KVM/libvirt]
     haproxy[HAProxy :443]
@@ -53,7 +53,7 @@ flowchart TB
 | Releases | Argo Rollouts blue-green + analysis | New version is checked before it gets traffic. |
 | Identity | Keycloak OIDC for Grafana, Argo CD, Headlamp | One login, one place to revoke access. |
 | Database | Keycloak DB on managed PostgreSQL | Moves stateful load off the single HDD. Rollback plan kept. |
-| CI | GitHub Actions deploys; Jenkins and GitLab CE build in parallel | Compare three CI systems on the same app. |
+| CI | Jenkins deploys; GitHub Actions and GitLab CE only build | Three CI systems compared on one app; Jenkins chosen for production. |
 | Monitoring | Prometheus, Alertmanager to Telegram | Catches problems while the cluster is alive. |
 | Dead man's switch | healthchecks.io pings from host and VMs | Catches the case where nothing is alive to alert. |
 | Backup | etcd snapshot, DB dump, GitLab backup, GPG, B2 | Offsite and encrypted; decryption is tested, not assumed. |
