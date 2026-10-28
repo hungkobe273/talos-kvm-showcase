@@ -14,8 +14,8 @@ flowchart TB
   dev[Developer push] --> jk[Jenkins on GCE]
   dev --> gh[GitHub Actions]
   dev --> gl[GitLab CE on GCE]
-  jk -->|image + tag bump| gitops[(GitOps repo)]
-  jk --> ghcr[(GHCR)]
+  jk -->|scan, sign, tag bump| gitops[(GitOps repo)]
+  jk -->|signed image| ghcr[(GHCR)]
   gh -->|image only| ghcr
   gl -->|image only| ghcr
 
@@ -30,12 +30,20 @@ flowchart TB
       kc[Keycloak]
       mon[Prometheus / Grafana]
       app[demo-app, Argo Rollouts blue-green]
+      harbor[Harbor registry]
+      kyv[Kyverno: signed images only]
+      vault[Vault + External Secrets]
     end
     backup[daily backup job]
   end
 
   gitops --> argo
   argo --> app
+  ghcr -->|pull replication + signatures| harbor
+  harbor -->|image pull| app
+  kyv -.->|admission| app
+  vault -->|.env| app
+  vault -->|auto-unseal| kms[(GCP KMS)]
   haproxy --> traefik
   kc --> supa[(Supabase PostgreSQL)]
   backup -->|GPG encrypted| b2[(Backblaze B2)]
@@ -49,11 +57,13 @@ flowchart TB
 |---|---|---|
 | OS | Talos Linux | Immutable, API-only nodes. No SSH, no drift. |
 | Delivery | Argo CD app-of-apps, self-heal | Git is the only way to change the cluster. |
-| Secrets | Sealed Secrets | Encrypted secrets can live in Git safely. |
+| Secrets | Sealed Secrets for infrastructure, Vault + External Secrets for app config | Encrypted secrets can live in Git; app values are rotated in Vault without a commit. |
 | Releases | Argo Rollouts blue-green + analysis | New version is checked before it gets traffic. |
-| Identity | Keycloak OIDC for Grafana, Argo CD, Headlamp | One login, one place to revoke access. |
+| Identity | Keycloak OIDC/SAML for 8 tools, each with a break-glass account | One login, one place to revoke access. |
 | Database | Keycloak DB on managed PostgreSQL | Moves stateful load off the single HDD. Rollback plan kept. |
 | CI | Jenkins deploys; GitHub Actions and GitLab CE only build | Three CI systems compared on one app; Jenkins chosen for production. |
+| Supply chain | gitleaks, govulncheck, gosec, SonarQube, Trivy, SBOM, cosign; Kyverno admits only signed images; ZAP scans the preview | Every gate was proven by a deliberately bad commit or image. |
+| Registry | Self-hosted Harbor, pull-replicated from GHCR with signatures | Image pulls stay inside the network; ghcr remains the source of truth. |
 | Monitoring | Prometheus, Alertmanager to Telegram | Catches problems while the cluster is alive. |
 | Dead man's switch | healthchecks.io pings from host and VMs | Catches the case where nothing is alive to alert. |
 | Backup | etcd snapshot, DB dump, GitLab backup, GPG, B2 | Offsite and encrypted; decryption is tested, not assumed. |
@@ -78,6 +88,20 @@ flowchart TB
 6. **Monitor the monitor.** In-cluster alerting cannot report its own death; an external heartbeat can.
 7. **Rehearse the rollback, both ways.** A drill moved Keycloak back to its local database and then forward
    to managed PostgreSQL again (see below). The way back worked first time; the way forward exposed a real gap.
+8. **"It works" is not "every path works".** Harbor served the web UI and replicated images for a day while its
+   token endpoint returned 500: the token-signing key was PKCS#8 (OpenSSL 3 default) and Harbor only reads PKCS#1.
+   It surfaced only when the first real registry client (Kyverno) asked for a token. Now every new component is
+   tested through the path its consumers actually use.
+9. **Auto-unseal moves the dependency, it does not remove it.** Vault unseals itself with GCP KMS, so a morning
+   without Internet left it sealed and every app secret stale. An alert now fires when Vault stays unready.
+
+## Measured (28/10)
+
+| What | Time |
+|---|---|
+| Cold start: control plane powered on to every app Synced/Healthy and every pod Ready | 9 min 29 s |
+| Push to production: commit, Jenkins pipeline with all gates, Harbor replication, blue-green with ZAP | ~12 min |
+| Image pull from in-cluster Harbor | 4.5 to 7 s |
 
 ## Rollback drill: Keycloak database (27/10)
 
@@ -104,5 +128,6 @@ Changes made after the drill:
 ## Stack
 
 Talos Linux, Kubernetes, KVM/libvirt, Argo CD, Argo Rollouts, Sealed Secrets, Traefik, cert-manager,
-Keycloak, Prometheus, Grafana, Alertmanager, GitHub Actions, Jenkins, GitLab CE, Docker, Google Cloud,
+Keycloak, Vault, External Secrets, Harbor, Kyverno, cosign, Trivy, SonarQube, OWASP ZAP, Prometheus, Grafana,
+Alertmanager, GitHub Actions, Jenkins, GitLab CE, Docker, Google Cloud,
 Supabase, Backblaze B2, Bash.
