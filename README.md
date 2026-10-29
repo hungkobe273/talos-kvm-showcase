@@ -66,7 +66,7 @@ flowchart TB
 | Registry | Self-hosted Harbor, pull-replicated from GHCR with signatures | Image pulls stay inside the network; ghcr remains the source of truth. |
 | Monitoring | Prometheus, Alertmanager to Telegram | Catches problems while the cluster is alive. |
 | Dead man's switch | healthchecks.io pings from host and VMs | Catches the case where nothing is alive to alert. |
-| Backup | etcd snapshot, DB dump, GitLab backup, GPG, B2 | Offsite and encrypted; decryption is tested, not assumed. |
+| Backup | etcd snapshot, DB dumps, Vault snapshot, GPG, B2 | Offsite and encrypted; decryption and a Vault restore are tested, not assumed. |
 | Cost | VMs run only 45 of 168 h/week, budget alerts | ~70% less compute spend on cloud credit. |
 
 ## Operating model
@@ -95,12 +95,22 @@ flowchart TB
 9. **Auto-unseal moves the dependency, it does not remove it.** Vault unseals itself with GCP KMS, so a morning
    without Internet left it sealed and every app secret stale. An alert now fires when Vault stays unready.
 
-## Measured (28/10)
+10. **A request is a promise to the scheduler, so it has to be true.** On 29/10 one worker came up first and took
+    almost every pod: its memory requests said 88%, real usage was higher, and Talos OOM-killed pods twice while
+    Keycloak was killed by its startup probe. Requests were reset to the measured 7-day p95, Keycloak moved to a
+    pre-built ("optimized") image, and a ValidatingAdmissionPolicy now flags any container without a memory request.
+11. **Restore drills find what backups hide.** The first Vault restore into a scratch namespace sealed itself again:
+    the snapshot carried an audit device whose path did not exist there. The restore runbook now says so.
 
-| What | Time |
+## Measured
+
+| What | Result |
 |---|---|
-| Cold start: control plane powered on to every app Synced/Healthy and every pod Ready | 9 min 29 s |
-| Push to production: commit, Jenkins pipeline with all gates, Harbor replication, blue-green with ZAP | ~12 min |
+| Cold start before the 29/10 fixes: control plane on → every pod Ready | ~50 min, 2 OOM kills, manual pod delete |
+| Cold start after the fixes (same day, same hardware) | 12 min 46 s, 0 OOM kills, no manual step |
+| Keycloak start: stock image vs pre-built image | 5–12 min build step on every start vs none |
+| Push to production: commit, Jenkins gates, Harbor replication, blue-green with ZAP | ~12 min |
+| Vault restore from the daily snapshot into a scratch namespace | ~2.5 min, data readable |
 | Image pull from in-cluster Harbor | 4.5 to 7 s |
 
 ## Rollback drill: Keycloak database (27/10)
