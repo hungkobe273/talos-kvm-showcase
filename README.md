@@ -1,8 +1,8 @@
 # talos-kvm: a production-style Kubernetes lab on one machine
 
 An on-premise Kubernetes platform built and operated during my internship at VTC Intecom (from 10/2026),
-with the brief "run it like production". Everything runs on a single Ubuntu host with one HDD,
-plus a few free or credit-funded cloud services.
+with the brief "run it like production". The cluster runs on a single Ubuntu host with one HDD,
+plus one cloud worker joined over WireGuard and a few free or credit-funded cloud services.
 
 This repository documents the design, the operating model and the lessons learned.
 The live GitOps repository is private; snippets here are sanitized (no hosts, keys or account IDs).
@@ -33,9 +33,15 @@ flowchart TB
       harbor[Harbor registry]
       kyv[Kyverno: signed images only]
       vault[Vault + External Secrets]
+      velero[Velero]
     end
     backup[daily backup job]
   end
+
+  subgraph gcp[Google Cloud, office hours only]
+    w3[worker 3: Prometheus, logs, controllers]
+  end
+  w3 <-->|KubeSpan / WireGuard| k8s
 
   gitops --> argo
   argo --> app
@@ -47,6 +53,8 @@ flowchart TB
   haproxy --> traefik
   kc --> supa[(Supabase PostgreSQL)]
   backup -->|GPG encrypted| b2[(Backblaze B2)]
+  backup -->|GPG encrypted, append-only| gcs[(Cloud Storage)]
+  velero -->|Kubernetes objects| gcs
   mon -->|alerts| tg[Telegram]
   host -->|heartbeat| hc[healthchecks.io]
 ```
@@ -59,14 +67,16 @@ flowchart TB
 | Delivery | Argo CD app-of-apps, self-heal | Git is the only way to change the cluster. |
 | Secrets | Sealed Secrets for infrastructure, Vault + External Secrets for app config | Encrypted secrets can live in Git; app values are rotated in Vault without a commit. |
 | Releases | Argo Rollouts blue-green + analysis | New version is checked before it gets traffic. |
-| Identity | Keycloak OIDC/SAML for 8 tools, each with a break-glass account | One login, one place to revoke access. |
+| Identity | Keycloak OIDC/SAML for 10 tools, each with a break-glass account | One login, one place to revoke access. |
+| Capacity | A cloud worker joined over KubeSpan (WireGuard), tainted so only chosen workloads land there | Moves Prometheus, logs and controllers off the HDD host; nothing that needs internal DNS goes there. |
 | Database | Keycloak DB on managed PostgreSQL | Moves stateful load off the single HDD. Rollback plan kept. |
 | CI | Jenkins deploys; GitHub Actions and GitLab CE only build | Three CI systems compared on one app; Jenkins chosen for production. |
 | Supply chain | gitleaks, govulncheck, gosec, SonarQube, Trivy, SBOM, cosign; Kyverno admits only signed images; ZAP scans the preview | Every gate was proven by a deliberately bad commit or image. |
 | Registry | Self-hosted Harbor, pull-replicated from GHCR with signatures | Image pulls stay inside the network; ghcr remains the source of truth. |
-| Monitoring | Prometheus, Alertmanager to Telegram | Catches problems while the cluster is alive. |
+| Monitoring | Prometheus, Alertmanager to Telegram; OpenTelemetry Collector to VictoriaLogs for central logs | Catches problems while the cluster is alive; one place to search every pod log, behind SSO. |
+| Vulnerabilities | Trivy scan of every running image each working day | A CVE published after the build still raises an alert. |
 | Dead man's switch | healthchecks.io pings from host and VMs | Catches the case where nothing is alive to alert. |
-| Backup | etcd snapshot, DB dumps, Vault snapshot, GPG, B2 | Offsite and encrypted; decryption and a Vault restore are tested, not assumed. |
+| Backup | etcd snapshot, DB dumps, Vault snapshot, GPG, to B2 and Cloud Storage; Velero for Kubernetes objects | Two offsite providers, one append-only; decryption and a Vault restore are tested, not assumed. |
 | Cost | VMs run only 45 of 168 h/week, budget alerts | ~70% less compute spend on cloud credit. |
 
 ## Operating model
@@ -101,6 +111,16 @@ flowchart TB
     pre-built ("optimized") image, and a ValidatingAdmissionPolicy now flags any container without a memory request.
 11. **Restore drills find what backups hide.** The first Vault restore into a scratch namespace sealed itself again:
     the snapshot carried an audit device whose path did not exist there. The restore runbook now says so.
+12. **A slow start can be caused by the shutdown.** Shutting nodes down one by one drained pods onto the node that
+    was still up, and kubelet marked the rest as Failed while the API could still record it. Next morning one worker
+    held 96% of the requests and replaced pods waited on the image-signature webhook. Shutting down without drain,
+    control plane first, keeps pods where they were.
+13. **A service can be "active" and still dead.** An SSH tunnel started before the captive portal let traffic out,
+    hung in the SSH handshake and never retried, while systemd reported it running. A connect timeout fixed it.
+14. **Retries must outlast the slowest dependency.** CI committed a new tag before the registry replicated it
+    (every 10 minutes); the admission webhook rejected the pod and Argo CD gave up after ~6 minutes of retries.
+15. **A VPN behind two NATs needs every endpoint it can learn.** The cloud worker lost 20–65% of packets in bursts
+    until KubeSpan was allowed to learn the NAT-mapped ports, and VXLAN inside WireGuard needed checksum offload off.
 
 ## Measured
 
@@ -108,6 +128,8 @@ flowchart TB
 |---|---|
 | Cold start before the 29/10 fixes: control plane on → every pod Ready | ~50 min, 2 OOM kills, manual pod delete |
 | Cold start after the fixes (same day, same hardware) | 12 min 46 s, 0 OOM kills, no manual step |
+| Cold start from a powered-off host, with the cloud worker (02/11) | ~11 min, no manual step |
+| CPU time waiting for disk during cold start (03/11), on-prem VMs vs cloud worker | 43–64% vs 0% |
 | Keycloak start: stock image vs pre-built image | 5–12 min build step on every start vs none |
 | Push to production: commit, Jenkins gates, Harbor replication, blue-green with ZAP | ~12 min |
 | Vault restore from the daily snapshot into a scratch namespace | ~2.5 min, data readable |
@@ -139,5 +161,5 @@ Changes made after the drill:
 
 Talos Linux, Kubernetes, KVM/libvirt, Argo CD, Argo Rollouts, Sealed Secrets, Traefik, cert-manager,
 Keycloak, Vault, External Secrets, Harbor, Kyverno, cosign, Trivy, SonarQube, OWASP ZAP, Prometheus, Grafana,
-Alertmanager, GitHub Actions, Jenkins, GitLab CE, Docker, Google Cloud,
-Supabase, Backblaze B2, Bash.
+Alertmanager, OpenTelemetry, VictoriaLogs, Velero, KubeSpan (WireGuard), GitHub Actions, Jenkins, GitLab CE,
+Docker, Google Cloud, Supabase, Backblaze B2, Bash.
