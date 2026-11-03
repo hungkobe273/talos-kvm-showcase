@@ -121,6 +121,19 @@ flowchart TB
     (every 10 minutes); the admission webhook rejected the pod and Argo CD gave up after ~6 minutes of retries.
 15. **A VPN behind two NATs needs every endpoint it can learn.** The cloud worker lost 20–65% of packets in bursts
     until KubeSpan was allowed to learn the NAT-mapped ports, and VXLAN inside WireGuard needed checksum offload off.
+16. **Measure where the bytes go before tuning.** Per-pod disk counters (Talos cgroup I/O stats) showed one webhook
+    re-reading 10.7 GB in 8 minutes because its memory limit evicted its own binary from the page cache, and the whole
+    cluster reading ~5.5 GB at start-up. Raising that limit and reading Keycloak's 381 MB of jars sequentially in a
+    sidecar before the JVM starts (JVM start 111 s → 25 s) took cold start from 11:30 to about 6 minutes.
+17. **Try the clever fix, keep the rollback ready.** A JVM class-data archive (AppCDS) for Keycloak built fine and then
+    crashed the JVM on the next start; it was reverted by hash within minutes. The StatefulSet would not replace the
+    crash-looping pod on its own, the same trap as in the rollback drill below.
+18. **A shutdown leaves stale state behind.** After a full stop the API still listed the old CoreDNS pod IPs as ready,
+    so DNS failed for 8–40 s after boot until the new endpoints appeared. Measuring has to use each pod's Ready
+    transition time after power-on, not the first green status.
+19. **Some default alerts assume a cluster that never sleeps.** The API error-budget alert fired every day because each
+    cold start produced a few hundred 500s on `/readyz` while the API booted. The rule group was turned off, with
+    API-down alerts and the external heartbeat still in place.
 
 ## Measured
 
@@ -129,7 +142,10 @@ flowchart TB
 | Cold start before the 29/10 fixes: control plane on → every pod Ready | ~50 min, 2 OOM kills, manual pod delete |
 | Cold start after the fixes (same day, same hardware) | 12 min 46 s, 0 OOM kills, no manual step |
 | Cold start from a powered-off host, with the cloud worker (02/11) | ~11 min, no manual step |
+| Cold start after the 03/11 fixes (host rebooted, VM power-on → every app Healthy) | 6:53 → 5:59, no pod recreated |
 | CPU time waiting for disk during cold start (03/11), on-prem VMs vs cloud worker | 43–64% vs 0% |
+| Keycloak JVM start at cold start, without vs with the jar prefetch sidecar | 98–111 s vs 25–29 s |
+| Data read from the shared HDD during one cold start | ~5.5 GB; the last three pods turn Ready within 11 s of each other |
 | Keycloak start: stock image vs pre-built image | 5–12 min build step on every start vs none |
 | Push to production: commit, Jenkins gates, Harbor replication, blue-green with ZAP | ~12 min |
 | Vault restore from the daily snapshot into a scratch namespace | ~2.5 min, data readable |
